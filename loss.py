@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+import numpy as np
 
 def cross_entropy(input, target):
     condition = torch.isclose(input, torch.zeros_like(input))
@@ -13,10 +14,13 @@ def cross_entropy(input, target):
     return -torch.sum(target * linput, dim=1)
 
 class BanditLoss(nn.Module):
-    def __init__(self, method='vanilla', alpha=0.5) -> None:
+    def __init__(self, method='vanilla', alpha=0.5, eps=0.001, gamma=0.3, verbose=False) -> None:
         super().__init__()
         self.method = method
         self.alpha = alpha
+        self.gamma = gamma
+        self.eps = eps
+        self.verbose = verbose
 
     def forward(self, inp, target, test=False):
         criterion =  nn.CrossEntropyLoss()
@@ -27,36 +31,41 @@ class BanditLoss(nn.Module):
             C = inp.shape[1]
             correct_target_distrib = F.one_hot(target, num_classes=C)
             incorr_target_distrib = (torch.ones_like(correct_target_distrib) - correct_target_distrib)/(C - 1)
+            
+            
             flag = (torch.argmax(inp, dim=1) == target).bool()
             corr_loss, incorr_loss = torch.tensor(0), torch.tensor(0)
             if flag.any().item():
                 corr_loss = criterion(inp[flag], correct_target_distrib.float()[flag])
             if (~flag).any().item():
                 incorr_loss = criterion(inp[~flag], incorr_target_distrib.float()[~flag])
-            return self.alpha * corr_loss + (1 - self.alpha) * incorr_loss
+            return corr_loss + self.alpha * incorr_loss
 
+        elif self.method == 'smooth':
+            k = inp.shape[1]
+            others = self.eps/(k - 1)
+            pred_target_distrib = F.one_hot(torch.argmax(inp, dim=1), num_classes=k)
+
+            P = (1 - self.gamma) * pred_target_distrib + self.gamma/k
+            cumsum = np.cumsum(P.cpu().numpy(), axis=1)
+            u = np.random.rand(len(cumsum), 1)
+            y_ = torch.tensor((u < cumsum).argmax(axis = 1)).cuda()
+            
+            corr_pred_mask = (y_ == target).bool().repeat(k, 1).T
+            corr_pos_mask = F.one_hot(y_, num_classes=k)
+            ce_distrib = torch.full_like(inp, others)
+
+            ce_distrib += (1 - self.eps - others)*torch.reciprocal(P) * \
+                corr_pred_mask * corr_pos_mask
+            assert (ce_distrib > 0).all()
+           
+            if self.verbose:
+                print("inp", inp[0])
+                print("corr", target[0])
+                print()
+
+
+            return criterion(inp, ce_distrib)
         else:
             raise AttributeError
-        # condition = input.sum(dim=1).int() != torch.ones(input.shape[0]).cuda()
-        # assert torch.all(torch.isclose(input.sum(dim=1), torch.ones(input.shape[0]).cuda()))
-        # my_ce = cross_entropy(input, correct_target_distrib).mean()
-        # torch_ce = nn.CrossEntropyLoss()(inp, target)
 
-        # if not torch.all(input >= 0):
-        #     print("input prob")
-        #     # print(inp)
-        #     print("inp stats:", inp.min().item(), inp.max().item())
-        #     print("input stats:", input.min().item(), input.max().item())
-
-
-        # incorr_target_distrib = torch.zeros_like(correct_target_distrib)
-        # print("input shape:", input.shape)
-        # print("correct_target_distrib:", correct_target_distrib.shape)
-        # print("incorr_target_distrib:", incorr_target_distrib.shape)
-
-        # print("my_ce:", my_ce.item(), "torch_ce:", torch_ce.item())
-        # if torch.isnan(my_ce).any():
-            # print("stats:", input.max().item(), input.min().item())
-        # print("diff", (my_ce - torch_ce).item())
-        # return torch_ce
-        return l.mean()
